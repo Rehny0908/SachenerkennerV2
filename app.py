@@ -2,60 +2,62 @@ import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
-from tensorflow.keras.models import load_model
-from huggingface_hub import hf_hub_download
+import requests
+from PIL import Image
 
-st.title("Echte KI: Emotion Detection (FER2013, Emo0.1)")
+st.title("Azure Face API Emotion Detection")
 
-# 1️⃣ Modell laden von Hugging Face
-@st.cache_resource
-def load_emotion_model():
-    model_path = hf_hub_download(
-        repo_id="shivamprasad1001/Emo0.1",
-        filename="facial_EmotionClassifer.h5"
-    )
-    return load_model(model_path)
+# 1️⃣ Azure Config
+AZURE_KEY = st.secrets["AZURE_KEY"]       # aus Streamlit secrets
+AZURE_ENDPOINT = st.secrets["AZURE_ENDPOINT"]
+FACE_API_URL = AZURE_ENDPOINT + "/face/v1.0/detect"
 
-model = load_emotion_model()
-emotion_labels = ["Angry", "Disgust", "Fear", "Happy", "Sad", "Surprise", "Neutral"]
-
-# 2️⃣ Bild-Upload
+# 2️⃣ Bild hochladen
 uploaded_file = st.file_uploader("Bild hochladen")
 
 if uploaded_file is not None:
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, 1)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = Image.open(uploaded_file).convert("RGB")
+    img_array = np.array(img)
+    st.image(img_array, caption="Hochgeladenes Bild", use_column_width=True)
 
-    # 3️⃣ Gesichter erkennen
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+    # 3️⃣ Bild für API vorbereiten
+    _, img_encoded = cv2.imencode(".jpg", img_array)
+    headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_KEY,
+        "Content-Type": "application/octet-stream"
+    }
+    params = {
+        "returnFaceAttributes": "emotion",
+        "returnFaceLandmarks": "false"
+    }
 
-    results = []
-
-    for (x, y, w, h) in faces:
-        roi_gray = gray[y:y+h, x:x+w]
-        roi_gray = cv2.resize(roi_gray, (48, 48))
-        roi_gray = roi_gray.astype("float") / 255.0
-        roi_gray = np.expand_dims(roi_gray, axis=(0, -1))  # (1,48,48,1)
-
-        preds = model.predict(roi_gray, verbose=0)[0]
-        emotion = emotion_labels[np.argmax(preds)]
-        results.append(preds)
-
-        # Rechteck + Emotion Text
-        cv2.rectangle(img, (x, y), (x+w, y+h), (255,0,0), 2)
-        cv2.putText(img, emotion, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-
-    st.image(img, channels="BGR")
-
-    # 4️⃣ Statistik: Durchschnitt aller Gesichter
-    if results:
-        avg_preds = np.mean(results, axis=0)
-        df = pd.DataFrame(list(zip(emotion_labels, avg_preds*100)), columns=["Emotion", "Score"])
-        st.subheader("Emotion Statistik (%)")
-        st.bar_chart(df.set_index("Emotion"))
+    response = requests.post(FACE_API_URL, headers=headers, params=params, data=img_encoded.tobytes())
+    
+    if response.status_code != 200:
+        st.error(f"API Fehler: {response.status_code}")
     else:
-        st.write("Kein Gesicht erkannt!")
+        faces = response.json()
+        if not faces:
+            st.write("Kein Gesicht erkannt!")
+        else:
+            # 4️⃣ Ergebnisse anzeigen
+            all_emotions = []
+            for face in faces:
+                rect = face["faceRectangle"]
+                emotions = face["faceAttributes"]["emotion"]
+                all_emotions.append(emotions)
+                
+                dominant_emotion = max(emotions, key=emotions.get)
+                st.write(f"Dominante Emotion: {dominant_emotion}")
+
+                # Rechteck um Gesicht malen
+                x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
+                cv2.rectangle(img_array, (x, y), (x+w, y+h), (255,0,0), 2)
+            
+            st.image(img_array, caption="Gesichter erkannt", use_column_width=True)
+
+            # 5️⃣ Emotion Statistik
+            df = pd.DataFrame(all_emotions)
+            df = df.mean().sort_values(ascending=False).to_frame(name="Score")
+            st.subheader("Emotion Statistik (%)")
+            st.bar_chart(df)
